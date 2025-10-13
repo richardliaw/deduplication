@@ -1,0 +1,27 @@
+name: deduplicate-documents-test-10gb
+image_uri: anyscale/ray:2.50.0-py312-cu128
+compute_config:
+  cloud: anyscale_gcp_public_default_cloud_us_west_1
+  head_node:
+    instance_type: n2-highmem-16
+  worker_nodes:
+    - instance_type: n2-highmem-64
+      min_nodes: 2
+      max_nodes: 5
+working_dir: .
+env_vars:
+  RAY_BACKEND_LOG_LEVEL: debug
+  RAY_DEFAULT_OBJECT_STORE_MEMORY_PROPORTION: '0.6'
+ray_version: 2.49.2
+entrypoint: |
+  python ray_data_dedup.py \
+    --input=gs://anyscale-example-datasets/HuggingFaceFW/fineweb-edu/data/ \
+    --output=gs://rliaw-scratch/dedup-test/ \
+    --text-column=text \
+    --id-column=id \
+    --threshold=0.7 \
+    --num-perm=128 \
+    --ngram-size=5 \
+    --max-cc-iterations=100 \
+    --limit=500000
+max_retries: 0
