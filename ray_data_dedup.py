@@ -25,6 +25,7 @@ from pyarrow import fs as pafs
 import ray
 from ray.data.aggregate import AggregateFnV2
 from scipy import integrate
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +210,18 @@ def generate_lsh_bands(
     which will be used to find candidate duplicate pairs.
 
     Returns a flattened batch where each row represents one band of one document.
+
+    Example:
+    {
+        'minhash': np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]),
+        'id': np.array([1, 2, 3]),
+    }
+    ->
+    {
+        'doc_id': np.array([1, 1, 1, 2, 2, 2, 3, 3, 3]),
+        'band_id': np.array([0, 1, 2, 0, 1, 2, 0, 1, 2]),
+        'band_hash': np.array(['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i']),
+    }
     """
     minhashes = batch['minhash']
     num_docs = len(minhashes)
@@ -223,6 +236,8 @@ def generate_lsh_bands(
         # Create sequential IDs if not present
         doc_ids = np.repeat(np.arange(num_docs), num_bands)
 
+    # np.tile repeats the entire array a given number of times.
+    # [0, 1, ..., num_bands-1] * num_docs times
     band_ids = np.tile(np.arange(num_bands), num_docs)
     band_hashes = []
 
@@ -242,51 +257,64 @@ def generate_lsh_bands(
     }
 
 
-def create_edges_from_candidates(
-    batch: Dict[str, np.ndarray]
-) -> Dict[str, np.ndarray]:
-    """
-    Create edges between documents that share the same band hash.
-
-    Input: grouped by (band_id, band_hash), contains list of doc_ids
-    Output: edges (pairs of doc_ids)
-    """
-    # This receives groups of doc_ids that share the same band_hash
-    doc_ids = batch['doc_id']
-
-    # Generate all pairs within this group
-    edges = []
-    for i in range(len(doc_ids)):
-        for j in range(i + 1, len(doc_ids)):
-            # Always put smaller ID first for consistency
-            u, v = sorted([doc_ids[i], doc_ids[j]])
-            edges.append((u, v))
-
-    if len(edges) == 0:
-        return {'src': np.array([], dtype=np.int64), 'dst': np.array([], dtype=np.int64)}
-
-    edges_array = np.array(edges)
-    return {
-        'src': edges_array[:, 0],
-        'dst': edges_array[:, 1],
-    }
-
-
 def deduplicate_edges(batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     """Remove duplicate edges from the edge list."""
-    if len(batch["src"]) == 0:
+    src = batch.get("src", np.array([], dtype=object))
+    dst = batch.get("dst", np.array([], dtype=object))
+
+    # Handle empty batches
+    if len(src) == 0 or len(dst) == 0:
         return {
-            'src': batch["src"],
-            'dst': batch["dst"]
+            'src': np.array([], dtype=object),
+            'dst': np.array([], dtype=object)
         }
-    edges = np.stack([batch['src'].tolist(), batch['dst'].tolist()], axis=1)
-    unique_edges = np.unique(edges, axis=0)
+
+    # Stack and deduplicate edges
+    # Convert to tuples for deduplication since np.unique doesn't work well with object arrays
+    edges = list(zip(src, dst))
+    unique_edges = list(set(edges))
+
+    if len(unique_edges) == 0:
+        return {
+            'src': np.array([], dtype=object),
+            'dst': np.array([], dtype=object)
+        }
+
+    # Unzip back to separate arrays
+    unique_src, unique_dst = zip(*unique_edges)
+
     return {
-        'src': unique_edges[:, 0],
-        'dst': unique_edges[:, 1],
+        'src': np.array(unique_src, dtype=object),
+        'dst': np.array(unique_dst, dtype=object),
     }
 
 
+# Flatten the nested edge_generation structure into src/dst columns
+def flatten_edges(batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    """Extract src and dst from the edge_generation nested dict."""
+    edge_data = batch['edge_generation']
+
+    # Collect all edges from all groups
+    all_src = []
+    all_dst = []
+
+    for edge_dict in edge_data:
+        if isinstance(edge_dict, dict):
+            src_list = edge_dict.get('src', [])
+            dst_list = edge_dict.get('dst', [])
+            if len(src_list) > 0:
+                all_src.extend(src_list)
+                all_dst.extend(dst_list)
+
+    # Return empty arrays if no edges found
+    if len(all_src) == 0:
+        return {'src': np.array([], dtype=object), 'dst': np.array([], dtype=object)}
+
+    # Keep IDs as their original type (could be strings or integers)
+    return {
+        'src': np.array(all_src, dtype=object),
+        'dst': np.array(all_dst, dtype=object),
+    }
 
 
 def large_star_iteration(batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
@@ -302,19 +330,22 @@ def large_star_iteration(batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     new_dst = []
 
     for u, v in zip(src, dst):
-        if u < v:
+        # Compare as strings for consistent ordering
+        u_str = str(u)
+        v_str = str(v)
+        if u_str < v_str:
             # Emit: v should point to u (smaller)
             new_src.append(v)
             new_dst.append(u)
-        elif v < u:
+        elif v_str < u_str:
             # Emit: u should point to v (smaller)
             new_src.append(u)
             new_dst.append(v)
         # If u == v, skip (self-loop)
 
     return {
-        'node': np.array(new_src, dtype=np.int64),
-        'parent': np.array(new_dst, dtype=np.int64),
+        'node': np.array(new_src, dtype=object),
+        'parent': np.array(new_dst, dtype=object),
     }
 
 
@@ -338,28 +369,35 @@ class MinParentAggregate(AggregateFnV2):
     Custom aggregate function to compute minimum parent for each node.
 
     This uses AggregateFnV2 for efficient distributed aggregation.
+    Works with both string and integer IDs.
     """
 
     def __init__(self):
         super().__init__(
-            name="min_parent",
-            zero_factory=lambda: np.inf,
+            name="parent",
+            zero_factory=lambda: None,
             on="parent",
             ignore_nulls=True,
         )
 
-    def aggregate_block(self, block: pa.Table) -> int:
+    def aggregate_block(self, block: pa.Table):
         """Aggregate a block by finding minimum parent."""
-        parents = block['parent'].to_numpy()
+        parents = block['parent'].to_pylist()
         if len(parents) == 0:
-            return np.inf
-        return int(np.min(parents))
+            return None
+        # Convert to strings for consistent comparison
+        return min(parents, key=str)
 
-    def combine(self, accumulator: int, partial: int) -> int:
+    def combine(self, accumulator, partial):
         """Combine partial results by taking minimum."""
-        return min(accumulator, partial)
+        if accumulator is None:
+            return partial
+        if partial is None:
+            return accumulator
+        # Compare as strings for consistent ordering
+        return min(accumulator, partial, key=str)
 
-    def finalize(self, accumulator: int) -> int:
+    def finalize(self, accumulator):
         """Finalize by returning the minimum parent."""
         return accumulator
 
@@ -384,11 +422,18 @@ class EdgeGenerationAggregate(AggregateFnV2):
         return accumulator + partial
 
     def finalize(self, accumulator: List[int]) -> Dict[str, List[int]]:
-        """Generate all pairs from the collected doc_ids."""
+        """Generate all pairs from the collected doc_ids, including self-edges."""
         doc_ids = accumulator
         edges_src = []
         edges_dst = []
 
+        # Add self-edges for all documents
+        # This ensures every document appears in components_ds
+        for doc_id in doc_ids:
+            edges_src.append(doc_id)
+            edges_dst.append(doc_id)
+
+        # Add edges between different documents
         for i in range(len(doc_ids)):
             for j in range(i + 1, len(doc_ids)):
                 u, v = sorted([doc_ids[i], doc_ids[j]])
@@ -433,6 +478,7 @@ def compute_connected_components_distributed(
 
     # Get unique nodes with their initial parents (themselves)
     current_ds = current_ds.groupby('node').aggregate(MinParentAggregate())
+    current_ds = current_ds.materialize()
 
     # Add edges as parent relationships
     edge_parents = edges_ds.map_batches(
@@ -443,9 +489,7 @@ def compute_connected_components_distributed(
         batch_format='numpy',
     )
 
-    current_ds = ray.data.DatasetContext.get_current().union(
-        current_ds, edge_parents
-    ) if hasattr(ray.data.DatasetContext, 'union') else current_ds.union(edge_parents)
+    current_ds = current_ds.union(edge_parents)
 
     # Initial aggregation using AggregateFnV2
     current_ds = current_ds.groupby('node').aggregate(MinParentAggregate())
@@ -524,29 +568,32 @@ def compute_connected_components_distributed(
 
 
 
-def filter_duplicates(
-    batch: Dict[str, np.ndarray],
-    components_dict: Dict[int, int],
-) -> Dict[str, np.ndarray]:
+class DistinctAggregate(AggregateFnV2):
     """
-    Filter out duplicate documents, keeping only one per component.
-
-    We keep documents that are roots of their component.
+    Aggregate function to collect distinct values.
+    Used to get all unique parents (documents to keep).
     """
-    if 'id' not in batch:
-        # Add sequential IDs if not present
-        batch['id'] = np.arange(len(batch[next(iter(batch.keys()))]))
 
-    doc_ids = batch['id']
+    def __init__(self, column_name: str):
+        super().__init__(
+            name=f"distinct_{column_name}",
+            zero_factory=lambda: set(),
+            on=column_name,
+            ignore_nulls=True,
+        )
 
-    # Keep documents that are not marked as duplicates
-    mask = np.array([
-        doc_id not in components_dict or components_dict[doc_id] == doc_id
-        for doc_id in doc_ids
-    ])
+    def aggregate_block(self, block: pa.Table) -> set:
+        """Collect distinct values from block."""
+        values = block.column(0).to_pylist()
+        return set(values)
 
-    # Filter all columns
-    return {k: v[mask] for k, v in batch.items()}
+    def combine(self, accumulator: set, partial: set) -> set:
+        """Merge sets."""
+        return set(accumulator) | set(partial)
+
+    def finalize(self, accumulator: set) -> list:
+        """Return as list."""
+        return list(accumulator)
 
 
 def deduplicate_dataset(
@@ -558,7 +605,6 @@ def deduplicate_dataset(
     seed: int = 42,
     checkpoint_dir: str | None = None,
     max_cc_iterations: int = 100,
-    limit: int | None = None,
 ) -> ray.data.Dataset:
     """
     Perform large-scale fuzzy deduplication using MinHash + LSH.
@@ -581,17 +627,13 @@ def deduplicate_dataset(
     """
     logger.info(f"Starting large-scale deduplication with threshold={threshold}")
 
-    # Limit dataset size if requested (for testing)
-    if limit is not None:
-        logger.info(f"Limiting to first {limit} documents for testing")
-        ds = ds.limit(limit)
-
     # Compute optimal LSH parameters
     num_bands, rows_per_band = optimal_param(threshold, num_perm)
     logger.info(f"LSH parameters: {num_bands} bands, {rows_per_band} rows per band")
 
     # Step 1: Generate MinHash signatures
     logger.info("Step 1: Generating MinHash signatures...")
+    # Schema: dict_keys(['*', 'minhash'])
     ds_with_minhash = ds.map_batches(
         generate_minhash_signatures,
         fn_kwargs={
@@ -612,6 +654,7 @@ def deduplicate_dataset(
 
     # Step 2: Generate LSH bands (creates multiple rows per document)
     logger.info("Step 2: Generating LSH bands...")
+    # Schema: ['doc_id', 'band_id', 'band_hash'], non are unique
     bands_ds = ds_with_minhash.map_batches(
         generate_lsh_bands,
         fn_kwargs={
@@ -620,6 +663,7 @@ def deduplicate_dataset(
         },
         batch_format='numpy',
     )
+    print("Generate LSH bands (schema):", bands_ds.take(1))
 
     # Step 3: Group by band to find candidate pairs
     logger.info("Step 3: Grouping by bands to find candidate pairs...")
@@ -628,22 +672,18 @@ def deduplicate_dataset(
     # Step 4: Generate edges from candidate pairs
     logger.info("Step 4: Generating edges from candidate pairs...")
     edges_ds = grouped_ds.aggregate(EdgeGenerationAggregate())
-    edges_ds = edges_ds.materialize()
-    print("half-way, adding columns now")
-    print(edges_ds.take(1))
-    edges_ds = edges_ds.add_column("src", lambda df: df["edge_generation"].str.get("src").tolist())
-    edges_ds = edges_ds.add_column("dst", lambda df: df["edge_generation"].str.get("dst").tolist())
-    edges_ds = edges_ds.materialize()
-    print("half-way")
-    # print(edges_ds.schema())
-    print(edges_ds.take(5))
+
+    # edges_ds has a edge_generation struct col; this flattens that
+    edges_ds = edges_ds.map_batches(flatten_edges, batch_format='numpy')
+
     # Deduplicate edges (same pair might appear in multiple bands)
     logger.info("Step 5: Deduplicating edges...")
-    edges_ds = edges_ds.map_batches(
-        deduplicate_edges,
-        batch_format='numpy',
-    )
-    edges_ds = edges_ds.materialize()
+    # Use groupby to deduplicate across all batches
+    # Group by (src, dst) and keep just one of each unique edge
+    edges_ds = edges_ds.groupby(['src', 'dst']).count()
+
+    # Drop the count column, we just need src and dst
+    edges_ds = edges_ds.drop_columns(['count()'])
 
     # Checkpoint edges
     if checkpoint_dir:
@@ -669,26 +709,23 @@ def deduplicate_dataset(
     # Step 7: Filter duplicates
     logger.info("Step 7: Filtering duplicates...")
 
-    # Rename 'node' to 'id' for filtering
-    components_ds = components_ds.map_batches(
-        lambda batch: {'id': batch['node'], 'parent': batch['parent']},
+    # Since we added self-edges, components_ds contains ALL documents
+    # Keep only documents where node == parent (representatives of each cluster)
+    deduplicated_components = components_ds.filter(
+        lambda row: row['node'] == row['parent']
+    )
+
+    logger.info(f"Deduplicated components count: {deduplicated_components.count()}")
+
+    # Now join back with original dataset to get the full document data
+    # Rename node -> id for joining
+    deduplicated_components = deduplicated_components.map_batches(
+        lambda batch: {'id': batch['node']},
         batch_format='numpy',
     )
 
-    # Collect components for filtering
-    # Note: For extremely large component sets (billions of docs),
-    # consider using a distributed join instead
-    logger.info("Materializing components for filtering...")
-    components_list = components_ds.take_all()
-    components_dict = {row['id']: row['parent'] for row in components_list}
-
-    logger.info(f"Found {len(components_dict)} documents in duplicate clusters")
-
-    deduplicated_ds = ds.map_batches(
-        filter_duplicates,
-        fn_kwargs={'components_dict': components_dict},
-        batch_format='numpy',
-    )
+    # Join with original dataset to get full document content
+    deduplicated_ds = ds.join(deduplicated_components, on='id', join_type='inner', num_partitions=100)
 
     return deduplicated_ds
 
@@ -707,7 +744,8 @@ def main():
     parser.add_argument(
         '--output',
         type=str,
-        required=True,
+        required=False,
+        default=os.path.join(os.environ["ANYSCALE_ARTIFACT_STORAGE"], "rliaw-scratch"),
         help='Output path for deduplicated data',
     )
     parser.add_argument(
@@ -779,8 +817,12 @@ def main():
     ds = ray.data.read_parquet(list_of_all_input_files)
 
     input_count = ds.count()
+    if args.limit is not None:
+        logger.info(f"Limiting input to {args.limit} documents")
+        assert input_count >= args.limit
+        ds = ds.limit(args.limit)
+        input_count = args.limit
     logger.info(f"Input dataset: {input_count} documents")
-    assert input_count >= args.limit
 
     # Deduplicate
     deduplicated_ds = deduplicate_dataset(
@@ -792,7 +834,6 @@ def main():
         seed=args.seed,
         checkpoint_dir=args.checkpoint_dir,
         max_cc_iterations=args.max_cc_iterations,
-        limit=args.limit,
     )
 
     # Write output

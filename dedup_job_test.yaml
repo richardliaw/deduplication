@@ -16,12 +16,16 @@ ray_version: 2.49.2
 entrypoint: |
   python ray_data_dedup.py \
     --input=gs://anyscale-example-datasets/HuggingFaceFW/fineweb-edu/data/ \
-    --output=gs://rliaw-scratch/dedup-test/ \
     --text-column=text \
     --id-column=id \
     --threshold=0.7 \
     --num-perm=128 \
     --ngram-size=5 \
     --max-cc-iterations=100 \
-    --limit=500000
+    --limit=50000
 max_retries: 0
+job_queue_config:
+  priority: 100
+  job_queue_spec:
+    name: dedup-cluster
+    idle_timeout_s: 1200
