@@ -258,64 +258,15 @@ def generate_lsh_bands(
     }
 
 
-def deduplicate_edges(batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-    """Remove duplicate edges from the edge list."""
-    src = batch.get("src", np.array([], dtype=object))
-    dst = batch.get("dst", np.array([], dtype=object))
-
-    # Handle empty batches
-    if len(src) == 0 or len(dst) == 0:
-        return {
-            'src': np.array([], dtype=object),
-            'dst': np.array([], dtype=object)
-        }
-
-    # Stack and deduplicate edges
-    # Convert to tuples for deduplication since np.unique doesn't work well with object arrays
-    edges = list(zip(src, dst))
-    unique_edges = list(set(edges))
-
-    if len(unique_edges) == 0:
-        return {
-            'src': np.array([], dtype=object),
-            'dst': np.array([], dtype=object)
-        }
-
-    # Unzip back to separate arrays
-    unique_src, unique_dst = zip(*unique_edges)
-
-    return {
-        'src': np.array(unique_src, dtype=object),
-        'dst': np.array(unique_dst, dtype=object),
-    }
-
-
-# Flatten the nested edge_generation structure into src/dst columns
-def flatten_edges(batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-    """Extract src and dst from the edge_generation nested dict."""
-    edge_data = batch['edge_generation']
-
-    # Collect all edges from all groups
-    all_src = []
-    all_dst = []
-
-    for edge_dict in edge_data:
-        if isinstance(edge_dict, dict):
-            src_list = edge_dict.get('src', [])
-            dst_list = edge_dict.get('dst', [])
-            if len(src_list) > 0:
-                all_src.extend(src_list)
-                all_dst.extend(dst_list)
-
-    # Return empty arrays if no edges found
-    if len(all_src) == 0:
-        return {'src': np.array([], dtype=object), 'dst': np.array([], dtype=object)}
-
-    # Keep IDs as their original type (could be strings or integers)
-    return {
-        'src': np.array(all_src, dtype=object),
-        'dst': np.array(all_dst, dtype=object),
-    }
+def create_edges(batch: pd.DataFrame) -> pd.DataFrame:
+    """Create edges from a batch of candidate pairs."""
+    # schema: band_id, band_hash, doc_id
+    # all band_id and band_hash are the same
+    # Generate all pairs of doc_id
+    doc_ids = batch['doc_id']
+    import itertools
+    edges = list(itertools.combinations(doc_ids.tolist(), 2))
+    return pd.DataFrame(edges, columns=['src', 'dst'])
 
 
 
@@ -335,7 +286,6 @@ def small_star_emit(row):
         return [{"node": u, "parent": v}]
     else:
         return [{"node": v, "parent": u}]
-
 
 
 def large_star_map_groups(batch: pd.DataFrame) -> pd.DataFrame:
@@ -360,50 +310,6 @@ def small_star_map_groups(batch: pd.DataFrame) -> pd.DataFrame:
     parent = batch['parent']
     mp = batch['parent'].min()
     return pd.DataFrame({'node': parent, 'parent': mp})
-
-
-class EdgeGenerationAggregate(AggregateFnV2):
-    """Generate all pairs of documents in the same band."""
-
-    def __init__(self):
-        super().__init__(
-            name="edge_generation",
-            zero_factory=lambda: [],
-            on="doc_id",
-            ignore_nulls=True,
-        )
-
-    def aggregate_block(self, block: pa.Table) -> List[int]:
-        """Collect all doc_ids in this block."""
-        return block['doc_id'].to_pylist()
-
-    def combine(self, accumulator: List[int], partial: List[int]) -> List[int]:
-        """Combine doc_id lists."""
-        return accumulator + partial
-
-    def finalize(self, accumulator: List[int]) -> Dict[str, List[int]]:
-        """Generate all pairs from the collected doc_ids, including self-edges."""
-        doc_ids = accumulator
-        edges_src = []
-        edges_dst = []
-
-        # Add self-edges for all documents
-        # This ensures every document appears in components_ds
-        for doc_id in doc_ids:
-            edges_src.append(doc_id)
-            edges_dst.append(doc_id)
-
-        # Add edges between different documents
-        for i in range(len(doc_ids)):
-            for j in range(i + 1, len(doc_ids)):
-                u, v = sorted([doc_ids[i], doc_ids[j]])
-                edges_src.append(u)
-                edges_dst.append(v)
-
-        return {
-            'src': edges_src,
-            'dst': edges_dst,
-        }
 
 
 def compute_connected_components_distributed(
@@ -432,6 +338,10 @@ def compute_connected_components_distributed(
     """
     logger.info("Computing connected components with distributed algorithm...")
 
+    current_ds = current_ds.rename_columns(
+        {'node': 'src', 'parent': 'dst'}
+    ).materialize()
+    print(f"Initial count: {current_ds.count()}")
     for i in range(max_iterations):
         # Step 1: Large-star
         current_ds = current_ds.flat_map(large_star_emit)
@@ -523,23 +433,14 @@ def deduplicate_dataset(
 
     # Step 3: Group by band to find candidate pairs
     logger.info("Step 3: Grouping by bands to find candidate pairs...")
-    grouped_ds = bands_ds.groupby(['band_id', 'band_hash'])
-
-    # Step 4: Generate edges from candidate pairs
-    logger.info("Step 4: Generating edges from candidate pairs...")
-    edges_ds = grouped_ds.aggregate(EdgeGenerationAggregate())
-
-    # edges_ds has a edge_generation struct col; this flattens that
-    edges_ds = edges_ds.map_batches(flatten_edges, batch_format='numpy')
+    edges_ds = bands_ds.groupby(
+        ['band_id', 'band_hash']).map_groups(create_edges, batch_format="pandas")
 
     # Deduplicate edges (same pair might appear in multiple bands)
     logger.info("Step 5: Deduplicating edges...")
     # Use groupby to deduplicate across all batches
     # Group by (src, dst) and keep just one of each unique edge
-    edges_ds = edges_ds.groupby(['src', 'dst']).count()
-
-    # Drop the count column, we just need src and dst
-    edges_ds = edges_ds.drop_columns(['count()'])
+    edges_ds = distinct(edges_ds, ['src', 'dst'])
 
     # Checkpoint edges
     if checkpoint_dir:
