@@ -22,6 +22,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
 from pyarrow import fs as pafs
+import pandas as pd
 import ray
 from ray.data.aggregate import AggregateFnV2
 from scipy import integrate
@@ -317,89 +318,48 @@ def flatten_edges(batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     }
 
 
-def large_star_iteration(batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-    """
-    Large star iteration: for each edge (u,v), if u < v, emit v -> u.
-    This propagates smaller IDs to their neighbors.
-    """
-    src = batch['src']
-    dst = batch['dst']
 
-    # For each edge, emit both directions with the smaller node as the target
-    new_src = []
-    new_dst = []
+def distinct(current_ds: ray.data.Dataset, columns: List[str]) -> ray.data.Dataset:
+    current_ds = current_ds.groupby(columns).count()
+    current_ds = current_ds.drop_columns(['count()'])
+    return current_ds
 
-    for u, v in zip(src, dst):
-        # Compare as strings for consistent ordering
-        u_str = str(u)
-        v_str = str(v)
-        if u_str < v_str:
-            # Emit: v should point to u (smaller)
-            new_src.append(v)
-            new_dst.append(u)
-        elif v_str < u_str:
-            # Emit: u should point to v (smaller)
-            new_src.append(u)
-            new_dst.append(v)
-        # If u == v, skip (self-loop)
+def large_star_emit(row):
+    u, v = row["node"], row["parent"]
+    return [{"node": u, "parent": v}, {"node": v, "parent": u}]
 
-    return {
-        'node': np.array(new_src, dtype=object),
-        'parent': np.array(new_dst, dtype=object),
-    }
+def small_star_emit(row):
+    """Emit (u, v) if u >= v else (v, u) -> (node, parent)"""
+    u, v = row["node"], row["parent"]
+    if u >= v:
+        return [{"node": u, "parent": v}]
+    else:
+        return [{"node": v, "parent": u}]
 
 
-def small_star_iteration(batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-    """
-    Small star iteration: propagate parent pointers transitively.
-    For each edge (u, parent[u]), emit (u, parent[parent[u]]).
-    """
-    nodes = batch['node']
-    parents = batch['parent']
 
-    # Keep the parent assignment
-    return {
-        'node': nodes,
-        'parent': parents,
-    }
+def large_star_map_groups(batch: pd.DataFrame) -> pd.DataFrame:
+    """Map groups for large-star.
 
+    take the minimum parent (mp)
+    Return dataframe (v, mp) where v > mp for v in neighborhood of node."""
+    node = batch['node']
+    assert len(set(node)) == 1
+    parent = batch['parent']
+    mp = batch['parent'].min()
+    parents = parent[parent > mp]
+    return pd.DataFrame({'node': parents, 'parent': mp})
 
-class MinParentAggregate(AggregateFnV2):
-    """
-    Custom aggregate function to compute minimum parent for each node.
+def small_star_map_groups(batch: pd.DataFrame) -> pd.DataFrame:
+    """Map groups for small-star.
 
-    This uses AggregateFnV2 for efficient distributed aggregation.
-    Works with both string and integer IDs.
-    """
-
-    def __init__(self):
-        super().__init__(
-            name="parent",
-            zero_factory=lambda: None,
-            on="parent",
-            ignore_nulls=True,
-        )
-
-    def aggregate_block(self, block: pa.Table):
-        """Aggregate a block by finding minimum parent."""
-        parents = block['parent'].to_pylist()
-        if len(parents) == 0:
-            return None
-        # Convert to strings for consistent comparison
-        return min(parents, key=str)
-
-    def combine(self, accumulator, partial):
-        """Combine partial results by taking minimum."""
-        if accumulator is None:
-            return partial
-        if partial is None:
-            return accumulator
-        # Compare as strings for consistent ordering
-        return min(accumulator, partial, key=str)
-
-    def finalize(self, accumulator):
-        """Finalize by returning the minimum parent."""
-        return accumulator
+    take the minimum parent (mp)
+    Return dataframe (v, mp) for all v in neighborhood of node"""
+    node = batch['node']
+    assert len(set(node)) == 1
+    parent = batch['parent']
+    mp = batch['parent'].min()
+    return pd.DataFrame({'node': parent, 'parent': mp})
 
 
 class EdgeGenerationAggregate(AggregateFnV2):
@@ -447,7 +407,7 @@ class EdgeGenerationAggregate(AggregateFnV2):
 
 
 def compute_connected_components_distributed(
-    edges_ds: ray.data.Dataset,
+    current_ds: ray.data.Dataset,
     max_iterations: int = 100,
 ) -> ray.data.Dataset:
     """
@@ -458,7 +418,13 @@ def compute_connected_components_distributed(
 
     Algorithm:
     1. Large-star: For each edge (u,v), point the larger node to the smaller
+        Emit (u, v) and (v, u) -> (node, parent)
+        Group by node and take the minimum parent (mp)
+        Emit (v, mp) where v > mp for v in neighborhood of node
     2. Small-star: Propagate parent pointers transitively
+        Emit (u, v) if u >= v else (v, u) -> (node, parent)
+        Group by node and take the minimum parent (mp)
+        Emit (v, mp) for all v in neighborhood of node
     3. Repeat until convergence
 
     Returns:
@@ -466,134 +432,24 @@ def compute_connected_components_distributed(
     """
     logger.info("Computing connected components with distributed algorithm...")
 
-    # Initialize: each node points to itself
-    # Start with edges as initial parent pointers
-    current_ds = edges_ds.map_batches(
-        lambda batch: {
-            'node': np.concatenate([batch['src'], batch['dst']]),
-            'parent': np.concatenate([batch['src'], batch['dst']]),
-        },
-        batch_format='numpy',
-    )
-
-    # Get unique nodes with their initial parents (themselves)
-    current_ds = current_ds.groupby('node').aggregate(MinParentAggregate())
-    current_ds = current_ds.materialize()
-
-    # Add edges as parent relationships
-    edge_parents = edges_ds.map_batches(
-        lambda batch: {
-            'node': batch['dst'],
-            'parent': batch['src'],
-        },
-        batch_format='numpy',
-    )
-
-    current_ds = current_ds.union(edge_parents)
-
-    # Initial aggregation using AggregateFnV2
-    current_ds = current_ds.groupby('node').aggregate(MinParentAggregate())
-
-    iteration = 0
-    prev_count = 0
-
-    while iteration < max_iterations:
-        iteration += 1
-        logger.info(f"Connected components iteration {iteration}")
-
-        # Materialize to enable checkpointing and multiple passes
+    for i in range(max_iterations):
+        # Step 1: Large-star
+        current_ds = current_ds.flat_map(large_star_emit)
+        current_ds = current_ds.groupby(['node']).map_groups(large_star_map_groups, batch_format="pandas")
+        current_ds = distinct(current_ds, ['node', 'parent'])
         current_ds = current_ds.materialize()
 
-        # Create parent lookup by duplicating dataset
-        parent_lookup = current_ds
+        # Step 2: Small-star
+        current_ds = current_ds.flat_map(small_star_emit)
+        current_ds = current_ds.groupby(['node']).map_groups(small_star_map_groups, batch_format="pandas")
+        current_ds = distinct(current_ds, ['node', 'parent'])
+        current_ds = current_ds.materialize()
 
-        # Large-star: join nodes with their parents
-        # For each (node, parent), look up parent's parent
+        print(f"Iteration {i}: {current_ds.count()}")
 
-        # Join current_ds with parent_lookup
-        # This is expensive - we need to propagate parent pointers
-
-        # Option 1: Broadcast small parent table (if fits in memory)
-        # Option 2: Distributed join
-
-        # For 3TB scale, we'll do iterative propagation without explicit join
-        # by using the edge-based approach
-
-        # Convert parent pointers to edges
-        edges_for_next = current_ds.map_batches(
-            lambda batch: {
-                'src': batch['parent'],
-                'dst': batch['node'],
-            },
-            batch_format='numpy',
-        )
-
-        # Apply large-star
-        large_star_edges = edges_for_next.map_batches(
-            large_star_iteration,
-            batch_format='numpy',
-        )
-
-        # Combine with current parent pointers
-        combined = ray.data.DatasetContext.get_current().union(
-            current_ds, large_star_edges
-        ) if hasattr(ray.data.DatasetContext, 'union') else current_ds.union(large_star_edges)
-
-        # Aggregate: for each node, take minimum parent using AggregateFnV2
-        next_ds = combined.groupby('node').aggregate(MinParentAggregate())
-
-        # Check convergence: count how many nodes changed parents
-        # For large scale, we use a sample-based check
-        sample_size = min(10000, next_ds.count())
-
-        if iteration % 5 == 0:
-            # Checkpoint periodically
-            logger.info(f"Checkpointing at iteration {iteration}")
-            next_ds = next_ds.materialize()
-
-        current_ds = next_ds
-
-        # Convergence check: if no changes in last iteration
-        current_count = current_ds.count()
-        if current_count == prev_count and iteration > 1:
-            logger.info(f"Converged after {iteration} iterations")
-            break
-
-        prev_count = current_count
-
-    logger.info(f"Connected components completed after {iteration} iterations")
 
     return current_ds
 
-
-
-
-class DistinctAggregate(AggregateFnV2):
-    """
-    Aggregate function to collect distinct values.
-    Used to get all unique parents (documents to keep).
-    """
-
-    def __init__(self, column_name: str):
-        super().__init__(
-            name=f"distinct_{column_name}",
-            zero_factory=lambda: set(),
-            on=column_name,
-            ignore_nulls=True,
-        )
-
-    def aggregate_block(self, block: pa.Table) -> set:
-        """Collect distinct values from block."""
-        values = block.column(0).to_pylist()
-        return set(values)
-
-    def combine(self, accumulator: set, partial: set) -> set:
-        """Merge sets."""
-        return set(accumulator) | set(partial)
-
-    def finalize(self, accumulator: set) -> list:
-        """Return as list."""
-        return list(accumulator)
 
 
 def deduplicate_dataset(
@@ -845,6 +701,21 @@ def main():
     logger.info(f"Removed {input_count - output_count} duplicates ({100*(input_count - output_count)/input_count:.1f}%)")
 
 
+def test_connected():
+    # Generate random graph
+    n = 10000
+    p = 0.01
+    # Generate n random edges between 0 and n-1 (uniformly)
+    edges = np.random.randint(0, n, size=(n, 2))
+    edges = pd.DataFrame(edges, columns=["node", "parent"])
+    ray.data.DataContext.get_current().enable_progress_bars = False
+
+    print(edges.head(5))
+    edges_ds = ray.data.from_pandas(edges)
+    components_ds = compute_connected_components_distributed(edges_ds, max_iterations=5)
+    print(components_ds.take(5))
+
+
 if __name__ == '__main__':
     logging.basicConfig(
         level=logging.INFO,
@@ -852,4 +723,6 @@ if __name__ == '__main__':
     )
 
     ray.init()
-    main()
+
+    test_connected()
+    # main()
