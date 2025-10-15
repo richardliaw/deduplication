@@ -19,12 +19,9 @@ import struct
 from typing import Dict, List, Set, Tuple, Optional
 
 import numpy as np
-import pyarrow as pa
-import pyarrow.compute as pc
 from pyarrow import fs as pafs
 import pandas as pd
 import ray
-from ray.data.aggregate import AggregateFnV2
 from scipy import integrate
 import os
 
@@ -318,7 +315,7 @@ def small_star_map_groups(batch: pd.DataFrame) -> pd.DataFrame:
 def compute_connected_components_distributed(
     current_ds: ray.data.Dataset,
     max_iterations: int = 100,
-    parallelism: int = None,
+    parallelism: int = 200,
     verbose=False
 ) -> ray.data.Dataset:
     """
@@ -345,11 +342,13 @@ def compute_connected_components_distributed(
 
     print(f"Initial count: {current_ds.count()}")
     num_components = current_ds.count()
-    convergence_counter = 5
+    convergence_counter = 3
     for i in range(max_iterations):
         # Step 1: Large-star
         current_ds = current_ds.flat_map(large_star_emit)
-        current_ds = current_ds.groupby(['node'], num_partitions=parallelism).map_groups(large_star_map_groups, batch_format="pandas")
+        current_ds = current_ds\
+            .groupby(['node'], num_partitions=parallelism)\
+            .map_groups(large_star_map_groups, batch_format="pandas")
         current_ds = distinct(current_ds, ['node', 'parent'])
         current_ds = current_ds.materialize()
         if verbose:
@@ -357,30 +356,30 @@ def compute_connected_components_distributed(
 
         # Step 2: Small-star
         current_ds = current_ds.flat_map(small_star_emit)
-        current_ds = current_ds.groupby(['node'], num_partitions=parallelism).map_groups(small_star_map_groups, batch_format="pandas")
+        current_ds = current_ds\
+            .groupby(['node'], num_partitions=parallelism)\
+            .map_groups(small_star_map_groups, batch_format="pandas")
         current_ds = distinct(current_ds, ['node', 'parent'])
         current_ds = current_ds.materialize()
-        if verbose:
-            print(current_ds.to_pandas())
-        df = current_ds.to_pandas()
-        components = df["parent"].value_counts()
 
-        if verbose:
-            print("components", components)
+        new_num_components = len(current_ds.unique("parent"))
 
-        if num_components == len(components):
+        if num_components == new_num_components:
             convergence_counter -= 1
         else:
             convergence_counter = 5
         if convergence_counter <= 0:
             break
 
-        num_components = len(components)
-        print(f"Iteration {i}: {current_ds.count()} - number of components: {num_components} - convergence_counter: {convergence_counter}")
+        num_components = new_num_components
+
+        print("-" * 10)
+        print(f"Iteration {i}: {current_ds.count()}")
+        print(f"number of components: {num_components}")
+        print(f"convergence_counter: {convergence_counter}")
+        print("-" * 10)
 
     return current_ds
-
-
 
 def deduplicate_dataset(
     ds: ray.data.Dataset,
@@ -389,9 +388,9 @@ def deduplicate_dataset(
     num_perm: int = 128,
     ngram_size: int = 5,
     seed: int = 42,
-    checkpoint_dir: str | None = None,
     max_cc_iterations: int = 100,
-    validate_local: bool = True,
+    validate_local: bool = False,
+    hash_parallelism: int = 100,
 ) -> ray.data.Dataset:
     """
     Perform large-scale fuzzy deduplication using MinHash + LSH.
@@ -405,7 +404,6 @@ def deduplicate_dataset(
         num_perm: Number of MinHash permutations
         ngram_size: Size of character n-grams
         seed: Random seed
-        checkpoint_dir: Directory for checkpointing intermediate results
         max_cc_iterations: Maximum iterations for connected components
         limit: If set, only process first N documents (for testing)
 
@@ -436,13 +434,6 @@ def deduplicate_dataset(
         batch_format='numpy',
     )
 
-    # Checkpoint after expensive MinHash computation
-    if checkpoint_dir:
-        minhash_path = f"{checkpoint_dir}/minhash"
-        logger.info(f"Checkpointing MinHash signatures to {minhash_path}")
-        ds_with_minhash.write_parquet(minhash_path, try_create_dir=True)
-        ds_with_minhash = ray.data.read_parquet(minhash_path)
-
     # Step 2: Generate LSH bands (creates multiple rows per document)
     logger.info("Step 2: Generating LSH bands...")
     # Schema: ['doc_id', 'band_id', 'band_hash'], non are unique
@@ -454,12 +445,11 @@ def deduplicate_dataset(
         },
         batch_format='numpy',
     )
-
+    bands_ds = bands_ds.materialize()
     # Step 3: Group by band to find candidate pairs
     logger.info("Step 3: Grouping by bands to find candidate pairs...")
     edges_ds = bands_ds.groupby(
-        ['band_id', 'band_hash']).map_groups(create_edges_from_collisions, batch_format="pandas")
-    edges_ds.repartition(target_num_rows_per_block=1000)
+        ['band_id', 'band_hash'], num_partitions=hash_parallelism).map_groups(create_edges_from_collisions, batch_format="pandas")
     edges_ds = edges_ds.materialize()
     print("Length of edges_ds", edges_ds.count())
 
@@ -470,13 +460,6 @@ def deduplicate_dataset(
     edges_ds = distinct(edges_ds, ['src', 'dst'])
     print("Length of edges_ds after distinct", edges_ds.count())
 
-    # Checkpoint edges
-    if checkpoint_dir:
-        edges_path = f"{checkpoint_dir}/edges"
-        logger.info(f"Checkpointing edges to {edges_path}")
-        edges_ds.write_parquet(edges_path, try_create_dir=True)
-        edges_ds = ray.data.read_parquet(edges_path)
-
     # Step 6: Compute connected components (distributed algorithm)
     logger.info("Step 6: Computing connected components (distributed)...")
     edges_ds = edges_ds.rename_columns(
@@ -485,19 +468,12 @@ def deduplicate_dataset(
     components_ds = compute_connected_components_distributed(
         edges_ds,
         max_iterations=max_cc_iterations,
-        parallelism=10,
+        parallelism=hash_parallelism,
     )
 
     # check local version
     if validate_local:
-        compute_connected_components_pandas(components_ds.to_pandas())
-
-    # Checkpoint components
-    if checkpoint_dir:
-        components_path = f"{checkpoint_dir}/components"
-        logger.info(f"Checkpointing components to {components_path}")
-        components_ds.write_parquet(components_path, try_create_dir=True)
-        components_ds = ray.data.read_parquet(components_path)
+        compute_connected_components_pandas(edges_ds.to_pandas())
 
     # Step 7: Filter duplicates
     logger.info("Step 7: Filtering duplicates...")
@@ -510,7 +486,11 @@ def deduplicate_dataset(
     logger.info(f"Duplicated components count: {duplicate_components.count()}")
     # Join with original dataset to get full document content
     deduplicated_ds = ds.join(
-        duplicate_components, on=('id',), right_on=('node',), join_type='left_anti', num_partitions=100)
+        duplicate_components,
+        on=('id',),
+        right_on=('node',),
+        join_type='left_anti',
+        num_partitions=hash_parallelism)
 
     return deduplicated_ds
 
@@ -570,12 +550,6 @@ def main():
         help='Random seed',
     )
     parser.add_argument(
-        '--checkpoint-dir',
-        type=str,
-        default=None,
-        help='Directory for checkpointing intermediate results',
-    )
-    parser.add_argument(
         '--max-cc-iterations',
         type=int,
         default=100,
@@ -587,9 +561,14 @@ def main():
         default=None,
         help='Limit number of documents to process (for testing on subset)',
     )
+    parser.add_argument(
+        "--parallelism",
+        type=int,
+        default=1000
+    )
 
     args = parser.parse_args()
-    ray.data.DataContext.get_current().enable_progress_bars = False
+    ray.data.DataContext.get_current().enable_progress_bars = True
 
     # Read input data
     logger.info(f"Reading data from {args.input}")
@@ -602,6 +581,7 @@ def main():
     ds = ray.data.read_parquet(list_of_all_input_files)
 
     input_count = ds.count()
+    print(f"Original input count {input_count}")
     if args.limit is not None:
         logger.info(f"Limiting input to {args.limit} documents")
         assert input_count >= args.limit
@@ -617,8 +597,8 @@ def main():
         num_perm=args.num_perm,
         ngram_size=args.ngram_size,
         seed=args.seed,
-        checkpoint_dir=args.checkpoint_dir,
         max_cc_iterations=args.max_cc_iterations,
+        hash_parallelism=args.parallelism
     )
 
     # Write output
