@@ -231,11 +231,7 @@ def generate_lsh_bands(
     output_size = num_docs * num_bands
 
     # Replicate document IDs for each band
-    if 'id' in batch:
-        doc_ids = np.repeat(batch['id'], num_bands)
-    else:
-        # Create sequential IDs if not present
-        doc_ids = np.repeat(np.arange(num_docs), num_bands)
+    doc_ids = np.repeat(batch['id'], num_bands)
 
     # np.tile repeats the entire array a given number of times.
     # [0, 1, ..., num_bands-1] * num_docs times
@@ -258,15 +254,16 @@ def generate_lsh_bands(
     }
 
 
-def create_edges(batch: pd.DataFrame) -> pd.DataFrame:
-    """Create edges from a batch of candidate pairs."""
+def create_edges_from_collisions(batch: pd.DataFrame) -> pd.DataFrame:
+    """Create edges from a batch of candidate pairs that collide."""
     # schema: band_id, band_hash, doc_id
     # all band_id and band_hash are the same
     # Generate all pairs of doc_id
     doc_ids = batch['doc_id']
     import itertools
     edges = list(itertools.combinations(doc_ids.tolist(), 2))
-    return pd.DataFrame(edges, columns=['src', 'dst'])
+    df = pd.DataFrame(edges, columns=['src', 'dst'])
+    return df
 
 
 
@@ -277,6 +274,8 @@ def distinct(current_ds: ray.data.Dataset, columns: List[str]) -> ray.data.Datas
 
 def large_star_emit(row):
     u, v = row["node"], row["parent"]
+    if u == v:
+        return [{"node": u, "parent": v}]
     return [{"node": u, "parent": v}, {"node": v, "parent": u}]
 
 def small_star_emit(row):
@@ -293,28 +292,34 @@ def large_star_map_groups(batch: pd.DataFrame) -> pd.DataFrame:
 
     take the minimum parent (mp)
     Return dataframe (v, mp) where v > mp for v in neighborhood of node."""
-    node = batch['node']
-    assert len(set(node)) == 1
-    parent = batch['parent']
-    mp = batch['parent'].min()
-    parents = parent[parent > mp]
-    return pd.DataFrame({'node': parents, 'parent': mp})
+    node = batch['node'].tolist()[0]
+    assert len(set(batch["node"])) == 1
+    neighbors = batch['parent'].tolist()
+    neighbors += [node]
+    mp = min(neighbors)
+    large_neighbors = [n for n in neighbors if n > node]
+    return pd.DataFrame({'node': large_neighbors, 'parent': mp})
 
 def small_star_map_groups(batch: pd.DataFrame) -> pd.DataFrame:
     """Map groups for small-star.
 
     take the minimum parent (mp)
-    Return dataframe (v, mp) for all v in neighborhood of node"""
-    node = batch['node']
-    assert len(set(node)) == 1
-    parent = batch['parent']
-    mp = batch['parent'].min()
-    return pd.DataFrame({'node': parent, 'parent': mp})
+    let N be all neighbors less than or equal to node
+    Return dataframe (v, mp) for all v in N"""
+    node = batch['node'].tolist()[0]
+    assert len(set(batch["node"])) == 1
+    neighbors = batch['parent'].tolist()
+    small_neighbors = [n for n in neighbors if n <= node]
+    small_neighbors += [node]
+    mp = min(small_neighbors)
+    return pd.DataFrame({'node': small_neighbors, 'parent': mp})
 
 
 def compute_connected_components_distributed(
     current_ds: ray.data.Dataset,
     max_iterations: int = 100,
+    parallelism: int = None,
+    verbose=False
 ) -> ray.data.Dataset:
     """
     Compute connected components using distributed large-star/small-star algorithm.
@@ -338,25 +343,40 @@ def compute_connected_components_distributed(
     """
     logger.info("Computing connected components with distributed algorithm...")
 
-    current_ds = current_ds.rename_columns(
-        {'node': 'src', 'parent': 'dst'}
-    ).materialize()
     print(f"Initial count: {current_ds.count()}")
+    num_components = current_ds.count()
+    convergence_counter = 5
     for i in range(max_iterations):
         # Step 1: Large-star
         current_ds = current_ds.flat_map(large_star_emit)
-        current_ds = current_ds.groupby(['node']).map_groups(large_star_map_groups, batch_format="pandas")
+        current_ds = current_ds.groupby(['node'], num_partitions=parallelism).map_groups(large_star_map_groups, batch_format="pandas")
         current_ds = distinct(current_ds, ['node', 'parent'])
         current_ds = current_ds.materialize()
+        if verbose:
+            print(current_ds.to_pandas())
 
         # Step 2: Small-star
         current_ds = current_ds.flat_map(small_star_emit)
-        current_ds = current_ds.groupby(['node']).map_groups(small_star_map_groups, batch_format="pandas")
+        current_ds = current_ds.groupby(['node'], num_partitions=parallelism).map_groups(small_star_map_groups, batch_format="pandas")
         current_ds = distinct(current_ds, ['node', 'parent'])
         current_ds = current_ds.materialize()
+        if verbose:
+            print(current_ds.to_pandas())
+        df = current_ds.to_pandas()
+        components = df["parent"].value_counts()
 
-        print(f"Iteration {i}: {current_ds.count()}")
+        if verbose:
+            print("components", components)
 
+        if num_components == len(components):
+            convergence_counter -= 1
+        else:
+            convergence_counter = 5
+        if convergence_counter <= 0:
+            break
+
+        num_components = len(components)
+        print(f"Iteration {i}: {current_ds.count()} - number of components: {num_components} - convergence_counter: {convergence_counter}")
 
     return current_ds
 
@@ -371,6 +391,7 @@ def deduplicate_dataset(
     seed: int = 42,
     checkpoint_dir: str | None = None,
     max_cc_iterations: int = 100,
+    validate_local: bool = True,
 ) -> ray.data.Dataset:
     """
     Perform large-scale fuzzy deduplication using MinHash + LSH.
@@ -429,18 +450,20 @@ def deduplicate_dataset(
         },
         batch_format='numpy',
     )
-    print("Generate LSH bands (schema):", bands_ds.take(1))
-
     # Step 3: Group by band to find candidate pairs
     logger.info("Step 3: Grouping by bands to find candidate pairs...")
     edges_ds = bands_ds.groupby(
-        ['band_id', 'band_hash']).map_groups(create_edges, batch_format="pandas")
+        ['band_id', 'band_hash']).map_groups(create_edges_from_collisions, batch_format="pandas")
+    edges_ds.repartition(target_num_rows_per_block=1000)
+    edges_ds = edges_ds.materialize()
+    print("Length of edges_ds", edges_ds.count())
 
     # Deduplicate edges (same pair might appear in multiple bands)
-    logger.info("Step 5: Deduplicating edges...")
+    logger.info("Step 4: Deduplicating edges...")
     # Use groupby to deduplicate across all batches
     # Group by (src, dst) and keep just one of each unique edge
     edges_ds = distinct(edges_ds, ['src', 'dst'])
+    print("Length of edges_ds after distinct", edges_ds.count())
 
     # Checkpoint edges
     if checkpoint_dir:
@@ -451,10 +474,18 @@ def deduplicate_dataset(
 
     # Step 6: Compute connected components (distributed algorithm)
     logger.info("Step 6: Computing connected components (distributed)...")
+    edges_ds = edges_ds.rename_columns(
+        {"src": "node", "dst": "parent"}
+    ).materialize()
     components_ds = compute_connected_components_distributed(
         edges_ds,
-        max_iterations=max_cc_iterations
+        max_iterations=max_cc_iterations,
+        parallelism=10,
     )
+
+    # check local version
+    if validate_local:
+        compute_connected_components_pandas(components_ds.to_pandas())
 
     # Checkpoint components
     if checkpoint_dir:
@@ -466,23 +497,16 @@ def deduplicate_dataset(
     # Step 7: Filter duplicates
     logger.info("Step 7: Filtering duplicates...")
 
-    # Since we added self-edges, components_ds contains ALL documents
-    # Keep only documents where node == parent (representatives of each cluster)
-    deduplicated_components = components_ds.filter(
-        lambda row: row['node'] == row['parent']
-    )
+    # Keep only documents where node != parent (extraneous components)
+    duplicate_components = components_ds.filter(
+        lambda row: row['node'] != row['parent']
+    ).materialize()
 
-    logger.info(f"Deduplicated components count: {deduplicated_components.count()}")
-
-    # Now join back with original dataset to get the full document data
-    # Rename node -> id for joining
-    deduplicated_components = deduplicated_components.map_batches(
-        lambda batch: {'id': batch['node']},
-        batch_format='numpy',
-    )
-
+    logger.info(f"Duplicated components count: {duplicate_components.count()}")
+    import ipdb; ipdb.set_trace()
     # Join with original dataset to get full document content
-    deduplicated_ds = ds.join(deduplicated_components, on='id', join_type='inner', num_partitions=100)
+    deduplicated_ds = ds.join(
+        duplicate_components, on=('id',), right_on=('node',), join_type='left_anti', num_partitions=100)
 
     return deduplicated_ds
 
@@ -602,19 +626,60 @@ def main():
     logger.info(f"Removed {input_count - output_count} duplicates ({100*(input_count - output_count)/input_count:.1f}%)")
 
 
-def test_connected():
+
+def compute_connected_components_pandas(edges_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute connected components for a local dataframe using scipy's DisjointSet.
+
+    This is an efficient local algorithm suitable for graphs that fit in memory.
+
+    Args:
+        edges_df: DataFrame with columns ['node', 'parent'] representing edges
+
+    Returns:
+        DataFrame with columns ['node', 'parent'] where parent is the component root
+    """
+    from scipy.cluster.hierarchy import DisjointSet
+    edges = edges_df[['node', 'parent']].values
+
+    # Create DisjointSet with all unique nodes
+    all_nodes = set()
+    for node, parent_node in edges:
+        all_nodes.add(node)
+        all_nodes.add(parent_node)
+
+    ds = DisjointSet(all_nodes)
+
+    # Merge edges
+    for node, parent_node in edges:
+        ds.merge(node, parent_node)
+    # Create result dataframe
+    result = pd.DataFrame({
+        'node': list(all_nodes),
+        'parent': [ds[node] for node in all_nodes]
+    })
+    print("Number of subsets:", ds.n_subsets)
+    return result
+
+
+def test_connected(local: bool = False):
     # Generate random graph
     n = 10000
-    p = 0.01
     # Generate n random edges between 0 and n-1 (uniformly)
-    edges = np.random.randint(0, n, size=(n, 2))
+    edges = np.random.randint(0, n, size=(n * 2, 2))
     edges = pd.DataFrame(edges, columns=["node", "parent"])
-    ray.data.DataContext.get_current().enable_progress_bars = False
 
-    print(edges.head(5))
+    print("running distributed")
+    ray.data.DataContext.get_current().enable_progress_bars = False
     edges_ds = ray.data.from_pandas(edges)
-    components_ds = compute_connected_components_distributed(edges_ds, max_iterations=5)
-    print(components_ds.take(5))
+    edges_ds = edges_ds.map_batches(lambda batch: batch, batch_format="pyarrow")
+    result = compute_connected_components_distributed(
+        edges_ds, max_iterations=10, parallelism=10)
+
+    print("Running local")
+    result = compute_connected_components_pandas(edges)
+
+    print(result)
 
 
 if __name__ == '__main__':
@@ -622,8 +687,6 @@ if __name__ == '__main__':
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     )
-
-    ray.init()
-
-    test_connected()
-    # main()
+    main()
+    # test_connected()
+    print("finished")
