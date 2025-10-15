@@ -413,6 +413,10 @@ def deduplicate_dataset(
         Deduplicated dataset
     """
     logger.info(f"Starting large-scale deduplication with threshold={threshold}")
+    # Need to materialize first if limiting, or else the limit could be non-deterministic
+    ds = ds.materialize()
+    masterset_uuids = set(x["id"] for x in ds.select_columns("id").take_all())
+    assert "Materialized" in str(type(ds))
 
     # Compute optimal LSH parameters
     num_bands, rows_per_band = optimal_param(threshold, num_perm)
@@ -450,6 +454,7 @@ def deduplicate_dataset(
         },
         batch_format='numpy',
     )
+
     # Step 3: Group by band to find candidate pairs
     logger.info("Step 3: Grouping by bands to find candidate pairs...")
     edges_ds = bands_ds.groupby(
@@ -503,7 +508,6 @@ def deduplicate_dataset(
     ).materialize()
 
     logger.info(f"Duplicated components count: {duplicate_components.count()}")
-    import ipdb; ipdb.set_trace()
     # Join with original dataset to get full document content
     deduplicated_ds = ds.join(
         duplicate_components, on=('id',), right_on=('node',), join_type='left_anti', num_partitions=100)
