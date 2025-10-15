@@ -367,7 +367,7 @@ def compute_connected_components_distributed(
         if num_components == new_num_components:
             convergence_counter -= 1
         else:
-            convergence_counter = 5
+            convergence_counter = 3
         if convergence_counter <= 0:
             break
 

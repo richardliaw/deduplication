@@ -6,8 +6,8 @@ compute_config:
     instance_type: n2-highmem-16
   worker_nodes:
     - instance_type: n2-highmem-64
-      min_nodes: 2
-      max_nodes: 5
+      min_nodes: 40
+      max_nodes: 50
 working_dir: .
 env_vars:
   RAY_BACKEND_LOG_LEVEL: debug
@@ -22,7 +22,8 @@ entrypoint: |
     --num-perm=128 \
     --ngram-size=5 \
     --max-cc-iterations=100 \
-    --limit=50000
+    --limit=100000000 \
+    --parallelism=2000
 max_retries: 0
 job_queue_config:
   priority: 100
