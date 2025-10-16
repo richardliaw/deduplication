@@ -6,7 +6,13 @@ compute_config:
     instance_type: n2-highmem-16
   worker_nodes:
     - instance_type: n2-highmem-64
-      min_nodes: 40
+      min_nodes: 30
+      max_nodes: 50
+    - instance_type: n4-standard-64
+      min_nodes: 0
+      max_nodes: 50
+    - instance_type: n4-highmem-64
+      min_nodes: 0
       max_nodes: 50
 working_dir: .
 env_vars:
@@ -23,10 +29,11 @@ entrypoint: |
     --ngram-size=5 \
     --max-cc-iterations=100 \
     --limit=100000000 \
-    --parallelism=2000
+    --parallelism=2000 \
+    --disable-progress-bars
 max_retries: 0
 job_queue_config:
   priority: 100
   job_queue_spec:
-    name: dedup-cluster
+    name: dedup-cluster-larger
     idle_timeout_s: 1200

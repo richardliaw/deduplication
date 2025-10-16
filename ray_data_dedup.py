@@ -251,7 +251,7 @@ def generate_lsh_bands(
     }
 
 
-def create_edges_from_collisions(batch: pd.DataFrame) -> pd.DataFrame:
+def create_edges_from_collisions(batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     """Create edges from a batch of candidate pairs that collide."""
     # schema: band_id, band_hash, doc_id
     # all band_id and band_hash are the same
@@ -261,11 +261,11 @@ def create_edges_from_collisions(batch: pd.DataFrame) -> pd.DataFrame:
     a = np.asarray(batch['doc_id'])
     n = a.shape[0]
     if n < 2:
-        return pd.DataFrame(columns=['src', 'dst'])
+        return {'src': np.array([]), 'dst': np.array([])}
 
     # indices for all i < j
     i, j = np.triu_indices(n, k=1)
-    return pd.DataFrame({'src': a[i], 'dst': a[j]})
+    return {'src': a[i], 'dst': a[j]}
 
 
 def distinct(current_ds: ray.data.Dataset, columns: List[str]) -> ray.data.Dataset:
@@ -458,7 +458,7 @@ def deduplicate_dataset(
     # Step 3: Group by band to find candidate pairs
     logger.info("Step 3: Grouping by bands to find candidate pairs...")
     edges_ds = bands_ds.groupby(
-        ['band_id', 'band_hash'], num_partitions=hash_parallelism).map_groups(create_edges_from_collisions, batch_format="pandas")
+        ['band_id', 'band_hash'], num_partitions=hash_parallelism).map_groups(create_edges_from_collisions, batch_format="numpy")
     edges_ds = edges_ds.materialize()
     print("Length of edges_ds", edges_ds.count())
 
