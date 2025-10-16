@@ -566,9 +566,16 @@ def main():
         type=int,
         default=1000
     )
+    parser.add_argument(
+        "--disable-progress-bars",
+        action="store_true",
+        default=False,
+        help="Disable progress bars",
+    )
 
     args = parser.parse_args()
-    ray.data.DataContext.get_current().enable_progress_bars = True
+    if args.disable_progress_bars:
+        ray.data.DataContext.get_current().enable_progress_bars = False
 
     # Read input data
     logger.info(f"Reading data from {args.input}")
