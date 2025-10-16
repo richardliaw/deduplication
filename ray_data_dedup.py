@@ -256,12 +256,16 @@ def create_edges_from_collisions(batch: pd.DataFrame) -> pd.DataFrame:
     # schema: band_id, band_hash, doc_id
     # all band_id and band_hash are the same
     # Generate all pairs of doc_id
-    doc_ids = batch['doc_id']
-    import itertools
-    edges = list(itertools.combinations(doc_ids.tolist(), 2))
-    df = pd.DataFrame(edges, columns=['src', 'dst'])
-    return df
 
+    # batch['doc_id'] can be a pandas Series or 1D array-like
+    a = np.asarray(batch['doc_id'])
+    n = a.shape[0]
+    if n < 2:
+        return pd.DataFrame(columns=['src', 'dst'])
+
+    # indices for all i < j
+    i, j = np.triu_indices(n, k=1)
+    return pd.DataFrame({'src': a[i], 'dst': a[j]})
 
 
 def distinct(current_ds: ray.data.Dataset, columns: List[str]) -> ray.data.Dataset:
@@ -341,8 +345,9 @@ def compute_connected_components_distributed(
     """
     logger.info("Computing connected components with distributed algorithm...")
 
-    print(f"Initial count: {current_ds.count()}")
+
     num_components = current_ds.count()
+    print(f"Initial count: {num_components}")
     convergence_counter = 3
     for i in range(max_iterations):
         # Step 1: Large-star
