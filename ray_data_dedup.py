@@ -267,6 +267,7 @@ def create_edges_from_collisions(batch: pd.DataFrame) -> pd.DataFrame:
 def distinct(current_ds: ray.data.Dataset, columns: List[str]) -> ray.data.Dataset:
     current_ds = current_ds.groupby(columns).count()
     current_ds = current_ds.drop_columns(['count()'])
+    current_ds = current_ds.materialize()
     return current_ds
 
 def large_star_emit(row):
@@ -349,6 +350,7 @@ def compute_connected_components_distributed(
         current_ds = current_ds\
             .groupby(['node'], num_partitions=parallelism)\
             .map_groups(large_star_map_groups, batch_format="pandas")
+        current_ds = current_ds.materialize()
         current_ds = distinct(current_ds, ['node', 'parent'])
         current_ds = current_ds.materialize()
         if verbose:
@@ -359,6 +361,8 @@ def compute_connected_components_distributed(
         current_ds = current_ds\
             .groupby(['node'], num_partitions=parallelism)\
             .map_groups(small_star_map_groups, batch_format="pandas")
+
+        current_ds = current_ds.materialize()
         current_ds = distinct(current_ds, ['node', 'parent'])
         current_ds = current_ds.materialize()
 
