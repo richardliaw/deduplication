@@ -296,7 +296,7 @@ def large_star_map_groups(batch: pd.DataFrame) -> pd.DataFrame:
     Return dataframe (v, mp) where v > mp for v in neighborhood of node."""
     node = batch['node'].tolist()[0]
     assert len(set(batch["node"])) == 1
-    neighbors = batch['parent'].tolist()
+    neighbors = list(set(batch['parent'].tolist()))
     neighbors += [node]
     mp = min(neighbors)
     large_neighbors = [n for n in neighbors if n > node]
@@ -310,7 +310,7 @@ def small_star_map_groups(batch: pd.DataFrame) -> pd.DataFrame:
     Return dataframe (v, mp) for all v in N"""
     node = batch['node'].tolist()[0]
     assert len(set(batch["node"])) == 1
-    neighbors = batch['parent'].tolist()
+    neighbors = list(set(batch['parent'].tolist()))
     small_neighbors = [n for n in neighbors if n <= node]
     small_neighbors += [node]
     mp = min(small_neighbors)
@@ -356,8 +356,8 @@ def compute_connected_components_distributed(
             .groupby(['node'], num_partitions=parallelism)\
             .map_groups(large_star_map_groups, batch_format="pandas")
         current_ds = current_ds.materialize()
-        current_ds = distinct(current_ds, ['node', 'parent'])
-        current_ds = current_ds.materialize()
+        # current_ds = distinct(current_ds, ['node', 'parent'])
+        # current_ds = current_ds.materialize()
         if verbose:
             print(current_ds.to_pandas())
 
@@ -368,8 +368,8 @@ def compute_connected_components_distributed(
             .map_groups(small_star_map_groups, batch_format="pandas")
 
         current_ds = current_ds.materialize()
-        current_ds = distinct(current_ds, ['node', 'parent'])
-        current_ds = current_ds.materialize()
+        # current_ds = distinct(current_ds, ['node', 'parent'])
+        # current_ds = current_ds.materialize()
 
         new_num_components = len(current_ds.unique("parent"))
 
