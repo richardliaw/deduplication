@@ -1,24 +1,25 @@
-name: deduplicate-documents-test-10gb
+name: deduplicate-documents-test-1tb
 image_uri: anyscale/ray:2.50.0-py312-cu128
 compute_config:
   cloud: anyscale_gcp_public_default_cloud_us_west_1
   head_node:
-    instance_type: n2-highmem-16
+    instance_type: n2-standard-64
   worker_nodes:
-    - instance_type: n2-highmem-64
+    # - instance_type: n2-highmem-64
+    #   min_nodes: 20
+    #   max_nodes: 100
+    - instance_type: n2-highmem-80
       min_nodes: 30
-      max_nodes: 50
-    - instance_type: n4-standard-64
-      min_nodes: 0
-      max_nodes: 50
-    - instance_type: n4-highmem-64
-      min_nodes: 0
-      max_nodes: 50
+      max_nodes: 100
+    - instance_type: n2-highmem-96
+      min_nodes: 20
+      max_nodes: 100
 working_dir: .
 env_vars:
   RAY_BACKEND_LOG_LEVEL: debug
-  RAY_DEFAULT_OBJECT_STORE_MEMORY_PROPORTION: '0.6'
-ray_version: 2.49.2
+  RAY_DEFAULT_OBJECT_STORE_MEMORY_PROPORTION: '0.5'
+  RAY_DATA_CLUSTER_AUTOSCALER: RAYTURBO_LEGACY
+ray_version: 2.50.0
 entrypoint: |
   python ray_data_dedup.py \
     --input=gs://anyscale-example-datasets/HuggingFaceFW/fineweb-edu/data/ \
@@ -28,12 +29,12 @@ entrypoint: |
     --num-perm=128 \
     --ngram-size=5 \
     --max-cc-iterations=100 \
-    --limit=100000000 \
-    --parallelism=2000 \
+    --limit=1000000000 \
+    --parallelism=300 \
     --disable-progress-bars
 max_retries: 0
 job_queue_config:
   priority: 100
   job_queue_spec:
-    name: dedup-cluster-larger
+    name: dedup-cluster-memlarge
     idle_timeout_s: 1200

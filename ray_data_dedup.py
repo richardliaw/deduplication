@@ -267,12 +267,28 @@ def create_edges_from_collisions(batch: Dict[str, np.ndarray]) -> Dict[str, np.n
     i, j = np.triu_indices(n, k=1)
     return {'src': a[i], 'dst': a[j]}
 
+import pyarrow as pa
 
-def distinct(current_ds: ray.data.Dataset, columns: List[str]) -> ray.data.Dataset:
-    current_ds = current_ds.groupby(columns).count()
-    current_ds = current_ds.drop_columns(['count()'])
+def cast_to_large_string(batch: pa.Table) -> pa.Table:
+    """Cast band_id and band_hash to large string."""
+    original_schema = batch.schema
+    new_schema = pa.schema([
+        original_schema.field('band_id'),
+        pa.field('band_hash', pa.large_string()),
+        original_schema.field('doc_id')
+    ])
+    return batch.cast(new_schema)
+
+
+def distinct_2col(current_ds: ray.data.Dataset, col_1, col_2, parallelism: int = 100) -> ray.data.Dataset:
+    def distinct_map_groups(batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+        unique_values = np.unique(batch[col_2])
+        return {col_1: np.repeat(batch[col_1][0], len(unique_values)), col_2: unique_values}
+    current_ds = current_ds.select_columns([col_1, col_2])
+    current_ds = current_ds.groupby(col_1, num_partitions=parallelism).map_groups(distinct_map_groups, batch_format="numpy")
     current_ds = current_ds.materialize()
     return current_ds
+
 
 def large_star_emit(row):
     u, v = row["node"], row["parent"]
@@ -289,32 +305,30 @@ def small_star_emit(row):
         return [{"node": v, "parent": u}]
 
 
-def large_star_map_groups(batch: pd.DataFrame) -> pd.DataFrame:
+def large_star_map_groups(batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     """Map groups for large-star.
 
     take the minimum parent (mp)
-    Return dataframe (v, mp) where v > mp for v in neighborhood of node."""
-    node = batch['node'].tolist()[0]
-    assert len(set(batch["node"])) == 1
-    neighbors = list(set(batch['parent'].tolist()))
-    neighbors += [node]
+    Return dataframe (v, mp) where v > node for v in neighborhood of node."""
+    node = batch['node'][0]
+    neighbors = np.unique(batch['parent'])
+    neighbors = np.concatenate([neighbors, np.array([node])])
     mp = min(neighbors)
-    large_neighbors = [n for n in neighbors if n > node]
-    return pd.DataFrame({'node': large_neighbors, 'parent': mp})
+    large_neighbors = neighbors[neighbors > node]
+    return {'node': large_neighbors, 'parent': np.repeat(mp, len(large_neighbors))}
 
-def small_star_map_groups(batch: pd.DataFrame) -> pd.DataFrame:
+def small_star_map_groups(batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
     """Map groups for small-star.
 
     take the minimum parent (mp)
     let N be all neighbors less than or equal to node
     Return dataframe (v, mp) for all v in N"""
-    node = batch['node'].tolist()[0]
-    assert len(set(batch["node"])) == 1
-    neighbors = list(set(batch['parent'].tolist()))
-    small_neighbors = [n for n in neighbors if n <= node]
-    small_neighbors += [node]
+    node = batch['node'][0]
+    neighbors = np.unique(batch['parent'])
+    small_neighbors = neighbors[neighbors <= node]
+    small_neighbors = np.concatenate([small_neighbors, np.array([node])])
     mp = min(small_neighbors)
-    return pd.DataFrame({'node': small_neighbors, 'parent': mp})
+    return {'node': small_neighbors, 'parent': np.repeat(mp, len(small_neighbors))}
 
 
 def compute_connected_components_distributed(
@@ -354,7 +368,7 @@ def compute_connected_components_distributed(
         current_ds = current_ds.flat_map(large_star_emit)
         current_ds = current_ds\
             .groupby(['node'], num_partitions=parallelism)\
-            .map_groups(large_star_map_groups, batch_format="pandas")
+            .map_groups(large_star_map_groups, batch_format="numpy")
         current_ds = current_ds.materialize()
         # current_ds = distinct(current_ds, ['node', 'parent'])
         # current_ds = current_ds.materialize()
@@ -365,7 +379,7 @@ def compute_connected_components_distributed(
         current_ds = current_ds.flat_map(small_star_emit)
         current_ds = current_ds\
             .groupby(['node'], num_partitions=parallelism)\
-            .map_groups(small_star_map_groups, batch_format="pandas")
+            .map_groups(small_star_map_groups, batch_format="numpy")
 
         current_ds = current_ds.materialize()
         # current_ds = distinct(current_ds, ['node', 'parent'])
@@ -422,7 +436,7 @@ def deduplicate_dataset(
     logger.info(f"Starting large-scale deduplication with threshold={threshold}")
     # Need to materialize first if limiting, or else the limit could be non-deterministic
     ds = ds.materialize()
-    masterset_uuids = set(x["id"] for x in ds.select_columns("id").take_all())
+    # masterset_uuids = set(x["id"] for x in ds.select_columns("id").take_all())
     assert "Materialized" in str(type(ds))
 
     # Compute optimal LSH parameters
@@ -466,7 +480,8 @@ def deduplicate_dataset(
     logger.info("Step 4: Deduplicating edges...")
     # Use groupby to deduplicate across all batches
     # Group by (src, dst) and keep just one of each unique edge
-    edges_ds = distinct(edges_ds, ['src', 'dst'])
+    edges_ds = distinct_2col(
+        edges_ds, col_1='src', col_2='dst', parallelism=hash_parallelism)
     print("Length of edges_ds after distinct", edges_ds.count())
 
     # Step 6: Compute connected components (distributed algorithm)
