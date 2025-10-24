@@ -19,6 +19,7 @@ import struct
 from typing import Dict, List, Set, Tuple, Optional
 
 import numpy as np
+import pyarrow as pa
 from pyarrow import fs as pafs
 import pandas as pd
 import ray
@@ -30,6 +31,25 @@ logger = logging.getLogger(__name__)
 # Constants
 MERSENNE_PRIME = np.uint64((1 << 61) - 1)
 MAX_HASH = np.uint32((1 << 32) - 1)
+
+
+def check_gcs_path_exists(path: str) -> bool:
+    """Check if a GCS path exists."""
+    gcs_fs = pafs.GcsFileSystem()
+
+    # Remove gs:// prefix if present
+    if path.startswith("gs://"):
+        path = path[5:]
+
+    # Remove trailing slash
+    path = path.rstrip("/")
+
+    logger.info(f"Listing parquet files in gs://{path}")
+
+    # Use FileSelector with recursive=True
+    selector = pafs.FileSelector(path, recursive=True)
+    file_infos = gcs_fs.get_file_info(selector)
+    return len(file_infos) > 0
 
 
 def list_gcs_parquet_files(path: str) -> List[str]:
@@ -264,20 +284,10 @@ def create_edges_from_collisions(batch: Dict[str, np.ndarray]) -> Dict[str, np.n
         return {'src': np.array([]), 'dst': np.array([])}
 
     # indices for all i < j
-    i, j = np.triu_indices(n, k=1)
-    return {'src': a[i], 'dst': a[j]}
-
-import pyarrow as pa
-
-def cast_to_large_string(batch: pa.Table) -> pa.Table:
-    """Cast band_id and band_hash to large string."""
-    original_schema = batch.schema
-    new_schema = pa.schema([
-        original_schema.field('band_id'),
-        pa.field('band_hash', pa.large_string()),
-        original_schema.field('doc_id')
-    ])
-    return batch.cast(new_schema)
+    min_doc_id = min(a)
+    src = np.repeat(min_doc_id, n)
+    dst = a
+    return {'src': src, 'dst': dst}
 
 
 def distinct_2col(current_ds: ray.data.Dataset, col_1, col_2, parallelism: int = 100) -> ray.data.Dataset:
@@ -288,6 +298,7 @@ def distinct_2col(current_ds: ray.data.Dataset, col_1, col_2, parallelism: int =
     current_ds = current_ds.groupby(col_1, num_partitions=parallelism).map_groups(distinct_map_groups, batch_format="numpy")
     current_ds = current_ds.materialize()
     return current_ds
+
 
 
 def large_star_emit(row):
@@ -330,6 +341,9 @@ def small_star_map_groups(batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]
     mp = min(small_neighbors)
     return {'node': small_neighbors, 'parent': np.repeat(mp, len(small_neighbors))}
 
+def cast_node_parent_large_string(batch: pa.Table) -> pa.Table:
+    """Cast node and parent to large string."""
+    return batch.select(['node', 'parent']).cast({'node': pa.large_string(), 'parent': pa.large_string()})
 
 def compute_connected_components_distributed(
     current_ds: ray.data.Dataset,
@@ -359,7 +373,9 @@ def compute_connected_components_distributed(
     """
     logger.info("Computing connected components with distributed algorithm...")
 
-
+    current_ds = current_ds.materialize()
+    current_ds = current_ds.map_batches(cast_node_parent_large_string, batch_format="pyarrow")
+    current_ds = current_ds.materialize()
     num_components = current_ds.count()
     print(f"Initial count: {num_components}")
     convergence_counter = 3
@@ -384,8 +400,8 @@ def compute_connected_components_distributed(
         current_ds = current_ds.materialize()
         # current_ds = distinct(current_ds, ['node', 'parent'])
         # current_ds = current_ds.materialize()
-
-        new_num_components = len(current_ds.unique("parent"))
+        # TODO - refactor this to be distributed
+        new_num_components = current_ds.groupby("parent").count().count()
 
         if num_components == new_num_components:
             convergence_counter -= 1
@@ -404,36 +420,23 @@ def compute_connected_components_distributed(
 
     return current_ds
 
-def deduplicate_dataset(
-    ds: ray.data.Dataset,
-    text_column: str = 'text',
-    threshold: float = 0.7,
-    num_perm: int = 128,
-    ngram_size: int = 5,
-    seed: int = 42,
-    max_cc_iterations: int = 100,
-    validate_local: bool = False,
-    hash_parallelism: int = 100,
-) -> ray.data.Dataset:
-    """
-    Perform large-scale fuzzy deduplication using MinHash + LSH.
 
-    Designed for 3TB+ scale using distributed algorithms throughout.
+def get_or_create_minhash_bands(
+        ds: ray.data.Dataset,
+        minhash_checkpoint_uri: Optional[str],
+        text_column: str,
+        threshold: float,
+        num_perm: int,
+        ngram_size: int,
+        seed: int,
+        output_blocks: int = 100) -> ray.data.MaterializedDataset:
 
-    Args:
-        ds: Input Ray dataset with text documents
-        text_column: Name of the column containing text
-        threshold: Jaccard similarity threshold (0.7 = 70% similar)
-        num_perm: Number of MinHash permutations
-        ngram_size: Size of character n-grams
-        seed: Random seed
-        max_cc_iterations: Maximum iterations for connected components
-        limit: If set, only process first N documents (for testing)
+    if minhash_checkpoint_uri is not None and check_gcs_path_exists(minhash_checkpoint_uri):
+        bands_ds = ray.data.read_parquet(minhash_checkpoint_uri)
+        bands_ds = bands_ds.repartition(num_blocks=output_blocks)
+        bands_ds = bands_ds.materialize()
+        return bands_ds
 
-    Returns:
-        Deduplicated dataset
-    """
-    logger.info(f"Starting large-scale deduplication with threshold={threshold}")
     # Need to materialize first if limiting, or else the limit could be non-deterministic
     ds = ds.materialize()
     # masterset_uuids = set(x["id"] for x in ds.select_columns("id").take_all())
@@ -460,7 +463,7 @@ def deduplicate_dataset(
     # Step 2: Generate LSH bands (creates multiple rows per document)
     logger.info("Step 2: Generating LSH bands...")
     # Schema: ['doc_id', 'band_id', 'band_hash'], non are unique
-    bands_ds = ds_with_minhash.map_batches(
+    bands_ds: ray.data.Dataset = ds_with_minhash.map_batches(
         generate_lsh_bands,
         fn_kwargs={
             'num_bands': num_bands,
@@ -469,6 +472,34 @@ def deduplicate_dataset(
         batch_format='numpy',
     )
     bands_ds = bands_ds.materialize()
+    bands_ds = bands_ds.repartition(num_blocks=output_blocks)
+    bands_ds = bands_ds.materialize()
+
+    if minhash_checkpoint_uri is not None:
+        bands_ds.write_parquet(minhash_checkpoint_uri)
+
+    return bands_ds
+
+def find_duplicate_components(
+    bands_ds: ray.data.Dataset,
+    max_cc_iterations: int = 100,
+    validate_local: bool = False,
+    hash_parallelism: int = 100,
+) -> ray.data.MaterializedDataset:
+    """
+    Find duplicate components in a dataset of bands/hashes.
+
+    Args:
+        bands_ds: Input Ray dataset with bands/hashes
+        max_cc_iterations: Maximum iterations for connected components
+        validate_local: Whether to validate the local version of the algorithm
+        hash_parallelism: Number of partitions for the hash step
+
+    Returns:
+        Deduplicated dataset
+    """
+    bands_ds = bands_ds.materialize()
+    print("Number of blocks in bands_ds", bands_ds.num_blocks())
     # Step 3: Group by band to find candidate pairs
     logger.info("Step 3: Grouping by bands to find candidate pairs...")
     edges_ds = bands_ds.groupby(
@@ -508,15 +539,7 @@ def deduplicate_dataset(
     ).materialize()
 
     logger.info(f"Duplicated components count: {duplicate_components.count()}")
-    # Join with original dataset to get full document content
-    deduplicated_ds = ds.join(
-        duplicate_components,
-        on=('id',),
-        right_on=('node',),
-        join_type='left_anti',
-        num_partitions=hash_parallelism)
-
-    return deduplicated_ds
+    return duplicate_components
 
 
 def main():
@@ -620,17 +643,37 @@ def main():
         input_count = args.limit
     logger.info(f"Input dataset: {input_count} documents")
 
-    # Deduplicate
-    deduplicated_ds = deduplicate_dataset(
+    logger.info(f"Starting large-scale deduplication with threshold={args.threshold}")
+
+    bands_ds = get_or_create_minhash_bands(
         ds,
         text_column=args.text_column,
         threshold=args.threshold,
         num_perm=args.num_perm,
         ngram_size=args.ngram_size,
         seed=args.seed,
+        minhash_checkpoint_uri=args.minhash_checkpoint_uri,
+        output_blocks=args.parallelism
+    )
+
+    # Duplicate components: Schema: ['node', 'parent']
+    duplicate_components = find_duplicate_components(
+        bands_ds,
         max_cc_iterations=args.max_cc_iterations,
+        validate_local=args.validate_local,
         hash_parallelism=args.parallelism
     )
+    duplicate_components = duplicate_components.materialize()
+
+    # Join with original dataset to get full document content
+    deduplicated_ds = ds.join(
+        duplicate_components,
+        on=(args.id_column,),
+        right_on=('node',),
+        join_type='left_anti',
+        num_partitions=args.parallelism)
+
+    deduplicated_ds = deduplicated_ds.materialize()
 
     # Write output
     logger.info(f"Writing deduplicated data to {args.output}")
