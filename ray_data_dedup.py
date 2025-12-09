@@ -343,7 +343,11 @@ def small_star_map_groups(batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]
 
 def cast_node_parent_large_string(batch: pa.Table) -> pa.Table:
     """Cast node and parent to large string."""
-    return batch.select(['node', 'parent']).cast({'node': pa.large_string(), 'parent': pa.large_string()})
+    new_schema = pa.schema([
+        pa.field('node', pa.large_string()),
+        pa.field('parent', pa.large_string()),
+    ])
+    return batch.select(['node', 'parent']).cast(new_schema)
 
 def compute_connected_components_distributed(
     current_ds: ray.data.Dataset,
@@ -374,14 +378,14 @@ def compute_connected_components_distributed(
     logger.info("Computing connected components with distributed algorithm...")
 
     current_ds = current_ds.materialize()
-    current_ds = current_ds.map_batches(cast_node_parent_large_string, batch_format="pyarrow")
-    current_ds = current_ds.materialize()
     num_components = current_ds.count()
     print(f"Initial count: {num_components}")
     convergence_counter = 3
     for i in range(max_iterations):
+        current_ds = current_ds.map_batches(cast_node_parent_large_string, batch_format="pyarrow")
+        current_ds = current_ds.materialize()
         # Step 1: Large-star
-        current_ds = current_ds.flat_map(large_star_emit)
+        current_ds = current_ds.flat_map(large_star_emit, memory=8*2**30)
         current_ds = current_ds\
             .groupby(['node'], num_partitions=parallelism)\
             .map_groups(large_star_map_groups, batch_format="numpy")
@@ -429,9 +433,11 @@ def get_or_create_minhash_bands(
         num_perm: int,
         ngram_size: int,
         seed: int,
-        output_blocks: int = 100) -> ray.data.MaterializedDataset:
+        output_blocks: int = 100) -> ray.data.Dataset:
 
-    if minhash_checkpoint_uri is not None and check_gcs_path_exists(minhash_checkpoint_uri):
+    if minhash_checkpoint_uri is not None:
+        if not check_gcs_path_exists(minhash_checkpoint_uri):
+            raise ValueError(f"Checkpoint URI {minhash_checkpoint_uri} does not exist")
         bands_ds = ray.data.read_parquet(minhash_checkpoint_uri)
         bands_ds = bands_ds.repartition(num_blocks=output_blocks)
         bands_ds = bands_ds.materialize()
@@ -485,7 +491,7 @@ def find_duplicate_components(
     max_cc_iterations: int = 100,
     validate_local: bool = False,
     hash_parallelism: int = 100,
-) -> ray.data.MaterializedDataset:
+) -> ray.data.Dataset:
     """
     Find duplicate components in a dataset of bands/hashes.
 
@@ -511,6 +517,7 @@ def find_duplicate_components(
     logger.info("Step 4: Deduplicating edges...")
     # Use groupby to deduplicate across all batches
     # Group by (src, dst) and keep just one of each unique edge
+
     edges_ds = distinct_2col(
         edges_ds, col_1='src', col_2='dst', parallelism=hash_parallelism)
     print("Length of edges_ds after distinct", edges_ds.count())
@@ -614,6 +621,11 @@ def main():
         default=1000
     )
     parser.add_argument(
+        "--minhash-checkpoint-uri",
+        type=str,
+        help="Checkpoint URI for minhash bands",
+    )
+    parser.add_argument(
         "--disable-progress-bars",
         action="store_true",
         default=False,
@@ -660,7 +672,6 @@ def main():
     duplicate_components = find_duplicate_components(
         bands_ds,
         max_cc_iterations=args.max_cc_iterations,
-        validate_local=args.validate_local,
         hash_parallelism=args.parallelism
     )
     duplicate_components = duplicate_components.materialize()

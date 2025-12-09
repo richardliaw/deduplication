@@ -1,25 +1,43 @@
 name: deduplicate-documents-test-1tb
-image_uri: anyscale/ray:2.50.0-py312-cu128
+# image_uri: us-central1-docker.pkg.dev/dogfood-clouds/chrisfellowes/ray:e7c4e51c-py312-cu123
+image_uri: anyscale/ray:2.52.0-py312-cu128
 compute_config:
   cloud: anyscale_gcp_public_default_cloud_us_west_1
   head_node:
-    instance_type: n2-standard-64
+    instance_type: n2-highmem-80
+    advanced_instance_config:
+      instance_properties:
+        disks:
+          - boot: true
+            auto_delete: true
+            initialize_params:
+              disk_size_gb: 800
   worker_nodes:
-    # - instance_type: n2-highmem-64
-    #   min_nodes: 20
-    #   max_nodes: 100
     - instance_type: n2-highmem-80
       min_nodes: 30
-      max_nodes: 100
+      max_nodes: 50
+      advanced_instance_config:
+        instance_properties:
+          disks:
+            - boot: true
+              auto_delete: true
+              initialize_params:
+                disk_size_gb: 300
     - instance_type: n2-highmem-96
       min_nodes: 20
-      max_nodes: 100
+      max_nodes: 50
+      advanced_instance_config:
+        instance_properties:
+          disks:
+            - boot: true
+              auto_delete: true
+              initialize_params:
+                disk_size_gb: 300
 working_dir: .
 env_vars:
-  RAY_BACKEND_LOG_LEVEL: debug
   RAY_DEFAULT_OBJECT_STORE_MEMORY_PROPORTION: '0.5'
-  RAY_DATA_CLUSTER_AUTOSCALER: RAYTURBO_LEGACY
-ray_version: 2.50.0
+  RAY_SCHEDULER_EVENTS: "0"
+ray_version: 2.50.1
 entrypoint: |
   python ray_data_dedup.py \
     --input=gs://anyscale-example-datasets/HuggingFaceFW/fineweb-edu/data/ \
@@ -30,11 +48,11 @@ entrypoint: |
     --ngram-size=5 \
     --max-cc-iterations=100 \
     --limit=1000000000 \
-    --parallelism=300 \
+    --parallelism=500 \
     --disable-progress-bars
 max_retries: 0
-job_queue_config:
-  priority: 100
-  job_queue_spec:
-    name: dedup-cluster-memlarge
-    idle_timeout_s: 1200
+# job_queue_config:
+#   priority: 100
+#   job_queue_spec:
+#     name: dedup-cluster-big-staging
+#     idle_timeout_s: 1200
